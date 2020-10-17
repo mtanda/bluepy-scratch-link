@@ -14,14 +14,13 @@ import logging
 import sys
 import signal
 import traceback
+import platform
 
 # for Bluetooth (e.g. Lego EV3)
 import bluetooth
 
 # for BLESession (e.g. BBC micro:bit)
-from bluepy.btle import Scanner, UUID, Peripheral, DefaultDelegate
-from bluepy.btle import BTLEDisconnectError, BTLEManagementError
-import bluepy_helper_cap
+from bleak import BleakScanner, BleakClient
 
 import threading
 import time
@@ -78,7 +77,7 @@ class Session():
         if jsonreq['jsonrpc'] != '2.0':
             logger.error("error: jsonrpc version is not 2.0")
             return True
-        jsonres = self.handle_request(jsonreq['method'], jsonreq['params'])
+        jsonres = await self.handle_request(jsonreq['method'], jsonreq['params'])
         if 'id' in jsonreq:
             jsonres['id'] = jsonreq['id']
         response = json.dumps(jsonres)
@@ -88,7 +87,7 @@ class Session():
             return True
         return False
 
-    def handle_request(self, method, params):
+    async def handle_request(self, method, params):
         """Default request handler"""
         logger.debug(f"default handle_request: {method}, {params}")
 
@@ -274,7 +273,7 @@ class BTSession(Session):
     def __del__(self):
         self.close()
 
-    def handle_request(self, method, params):
+    async def handle_request(self, method, params):
         """Handle requests from Scratch"""
         logger.debug("handle request to BT device")
         logger.debug(method)
@@ -345,17 +344,6 @@ class BLESession(Session):
     CONNECTED = 3
     DONE = 4
 
-    SERVICE_CLASS_UUID_ADTYPES = {
-        0x7: "adtype complete 128b",
-        0x3: "adtype complete 16b",
-        0x6: "adtype incomplete 128b",
-        0x5: "adtype complete 32b",
-        0x4: "adtype incomplete 32b",
-        0x2: "adtype incomplete 16b",
-    }
-
-    MAX_SCANNER_IF = 3
-
     class BLEThread(threading.Thread):
         """
         Separated thread to control notifications to Scratch.
@@ -375,58 +363,17 @@ class BLESession(Session):
                     for d in devices:
                         params = { 'rssi': d.rssi }
                         params['peripheralId'] = devices.index(d)
-                        params['name'] = d.getValueText(0x9) or d.getValueText(0x8)
+                        params['name'] = d.name
                         self.session.notify('didDiscoverPeripheral', params)
                     time.sleep(1)
                 elif self.session.status == self.session.CONNECTED:
                     logger.debug("in connected status:")
-                    delegate = self.session.delegate
-                    if delegate and len(delegate.handles) > 0:
-                        if not delegate.restart_notification_event.is_set():
-                            delegate.restart_notification_event.wait()
-                        try:
-                            logger.debug("getting lock for waitForNotification")
-                            with self.session.lock:
-                                logger.debug("before waitForNotification")
-                                self.session.perip.waitForNotifications(0.0001)
-                                logger.debug("after waitForNotification")
-                            logger.debug("released lock for waitForNotification")
-                        except Exception as e:
-                            logger.error(e)
-                            self.session.close()
-                            break
-                    else:
-                        time.sleep(0.0)
                     # To avoid repeated lock by this single thread,
                     # yield CPU to other lock waiting threads.
                     time.sleep(0)
                 else:
                     # Nothing to do:
                     time.sleep(0)
-
-    class BLEDelegate(DefaultDelegate):
-        """
-        A bluepy handler to receive notifictions from BLE devices.
-        """
-        def __init__(self, session):
-            DefaultDelegate.__init__(self)
-            self.session = session
-            self.handles = {}
-            self.restart_notification_event = threading.Event()
-            self.restart_notification_event.set()
-
-        def add_handle(self, serviceId, charId, handle):
-            logger.debug(f"add handle for notification: {handle}")
-            params = { 'serviceId': UUID(serviceId).getCommonName(),
-                       'characteristicId': charId,
-                       'encoding': 'base64' }
-            self.handles[handle] = params
-
-        def handleNotification(self, handle, data):
-            logger.debug(f"BLE notification: {handle} {data}")
-            params = self.handles[handle].copy()
-            params['message'] = base64.standard_b64encode(data).decode('ascii')
-            self.session.notify('characteristicDidChange', params)
 
     def __init__(self, websocket, loop):
         super().__init__(websocket, loop)
@@ -435,7 +382,7 @@ class BLESession(Session):
         self.device = None
         self.deviceName = None
         self.perip = None
-        self.delegate = None
+        self.queue = asyncio.Queue()
 
     def close(self):
         self.status = self.DONE
@@ -449,26 +396,18 @@ class BLESession(Session):
     def __del__(self):
         self.close()
 
-    def _get_dev_uuid(self, dev):
-        for adtype in self.SERVICE_CLASS_UUID_ADTYPES:
-            service_class_uuid = dev.getValueText(adtype)
-            if service_class_uuid:
-                logger.debug(self.SERVICE_CLASS_UUID_ADTYPES[adtype])
-                return UUID(service_class_uuid)
-        return None
-
     def matches(self, dev, filters):
         """
         Check if the found BLE device matches the filters Scratch specifies.
         """
-        logger.debug(f"in matches {dev.addr} {filters}")
+        logger.debug(f"in matches {dev.address} {filters}")
         for f in filters:
             if 'services' in f:
                 for s in f['services']:
                     logger.debug(f"service to check: {s}")
                     given_uuid = s
                     logger.debug(f"given: {given_uuid}")
-                    dev_uuid = self._get_dev_uuid(dev)
+                    dev_uuid = dev.address
                     if not dev_uuid:
                         continue
                     logger.debug(f"dev: {dev_uuid}")
@@ -478,7 +417,7 @@ class BLESession(Session):
                         return True
             if 'namePrefix' in f:
                 # 0x08: Shortened Local Name
-                deviceName = dev.getValueText(0x08)
+                deviceName = dev.name
                 if not deviceName:
                     continue
                 logger.debug(f"Name of \"{deviceName}\" begins with: \"{f['namePrefix']}\"?")
@@ -492,10 +431,6 @@ class BLESession(Session):
                 # ref: https://github.com/LLK/scratch-link/blob/develop/Documentation/BluetoothLE.md
         return False
 
-    def _get_service(self, service_id):
-        with self.lock:
-            service = self.perip.getServiceByUUID(UUID(service_id))
-
     def _get_characteristic(self, chara_id):
         if not self.perip:
             return None
@@ -503,12 +438,8 @@ class BLESession(Session):
             charas = self.perip.getCharacteristics(uuid=chara_id)
             return charas[0]
 
-    def handle_request(self, method, params):
+    async def handle_request(self, method, params):
         """Handle requests from Scratch"""
-        if self.delegate:
-            # Do not allow notification during request handling to avoid
-            # websocket server errors
-            self.delegate.restart_notification_event.clear()
 
         logger.debug("handle request to BLE device")
         logger.debug(method)
@@ -525,17 +456,15 @@ class BLESession(Session):
                 logger.error("e.g. $ sudo bluepy_helper_cap.py")
                 sys.exit(1)
             found_ifaces = 0
-            for i in range(self.MAX_SCANNER_IF):
-                scanner = Scanner(iface=i)
-                try:
-                    devices = scanner.scan(10.0)
-                    for dev in devices:
-                        if self.matches(dev, params['filters']):
-                            self.found_devices.append(dev)
-                    found_ifaces += 1
-                    logger.debug(f"BLE device found with iface #{i}");
-                except BTLEManagementError as e:
-                    logger.debug(f"BLE iface #{i}: {e}");
+            try:
+                devices = await BleakScanner.discover(timeout=10.0)
+                for dev in devices:
+                    if self.matches(dev, params['filters']):
+                        self.found_devices.append(dev)
+                found_ifaces += 1
+                logger.debug(f"BLE device found");
+            except e:
+                logger.debug(f"BLE iface: {e}");
 
             if found_ifaces == 0:
                 err_msg = "Can not scan BLE devices. Check BLE controller."
@@ -558,19 +487,18 @@ class BLESession(Session):
         elif self.status == self.DISCOVERY and method == 'connect':
             logger.debug("connecting to the BLE device")
             self.device = self.found_devices[params['peripheralId']]
-            self.deviceName = self.device.getValueText(0x9) or self.device.getValueText(0x8)
+            self.deviceName = self.device.name
             try:
-                self.perip = Peripheral(self.device)
+                self.perip = BleakClient(self.device.address)
+                await self.perip.connect()
                 logger.info(f"connected to the BLE peripheral: {self.deviceName}")
-            except BTLEDisconnectError as e:
+            except e:
                 logger.error(f"failed to connect to the BLE device \"{self.deviceName}\": {e}")
                 self.status = self.DONE
 
             if self.perip:
                 res["result"] = None
                 self.status = self.CONNECTED
-                self.delegate = self.BLEDelegate(self)
-                self.perip.withDelegate(self.delegate)
             else:
                 err_msg = f"BLE connect failed: {self.deviceName}"
                 res["error"] = { "message": err_msg }
@@ -580,36 +508,38 @@ class BLESession(Session):
             logger.debug("handle read request")
             service_id = params['serviceId']
             chara_id = params['characteristicId']
-            c = self._get_characteristic(chara_id)
-            if not c or c.uuid != UUID(chara_id):
+            s = await self.perip.get_services()
+            c = s.get_characteristic(chara_id)
+            if not c or c.uuid != chara_id:
                 logger.error(f"Failed to get characteristic {chara_id}")
                 self.status = self.DONE
             else:
                 with self.lock:
-                    b = c.read()
+                    b = await self.perip.read_gatt_char(chara_id)
                 message = base64.standard_b64encode(b).decode('ascii')
                 res['result'] = { 'message': message, 'encode': 'base64' }
             if params.get('startNotifications') == True:
-                self.startNotifications(service_id, chara_id)
+                await self.startNotifications(service_id, chara_id)
 
         elif self.status == self.CONNECTED and method == 'startNotifications':
             logger.debug("handle startNotifications request")
             service_id = params['serviceId']
             chara_id = params['characteristicId']
-            self.startNotifications(service_id, chara_id)
+            await self.startNotifications(service_id, chara_id)
 
         elif self.status == self.CONNECTED and method == 'stopNotifications':
             logger.debug("handle stopNotifications request")
             service_id = params['serviceId']
             chara_id = params['characteristicId']
-            self.stopNotifications(service_id, chara_id)
+            await self.stopNotifications(service_id, chara_id)
 
         elif self.status == self.CONNECTED and method == 'write':
             logger.debug("handle write request")
             service_id = params['serviceId']
             chara_id = params['characteristicId']
-            c = self._get_characteristic(chara_id)
-            if not c or c.uuid != UUID(chara_id):
+            s = await self.perip.get_services()
+            c = s.get_characteristic(chara_id)
+            if not c or c.uuid != chara_id:
                 logger.error(f"Failed to get characteristic {chara_id}")
                 self.status = self.DONE
             else:
@@ -620,35 +550,31 @@ class BLESession(Session):
                 data = base64.standard_b64decode(msg_bstr)
                 logger.debug("getting lock for c.write()")
                 with self.lock:
-                    c.write(data)
+                    await self.perip.write_gatt_char(chara_id, data)
                 logger.debug("released lock for c.write()")
                 res['result'] = len(data)
 
         logger.debug(res)
         return res
 
-    def setNotifications(self, service_id, chara_id, value):
-        service = self._get_service(service_id)
-        c = self._get_characteristic(chara_id)
-        handle = c.getHandle()
-        # prepare notification handler
-        self.delegate.add_handle(service_id, chara_id, handle)
-        # request notification to the BLE device
-        with self.lock:
-            self.perip.writeCharacteristic(handle + 1, value, True)
+    async def worker(self, service_id, chara_id, data, queue):
+        logger.debug(f"BLE notification: {chara_id} {data}")
+        params = { 'serviceId': service_id,
+           'characteristicId': chara_id,
+           'encoding': 'base64' }
+        params['message'] = base64.standard_b64encode(data).decode('ascii')
+        self.notify('characteristicDidChange', params)
 
-    def startNotifications(self, service_id, chara_id):
+    async def startNotifications(self, service_id, chara_id):
         logger.debug(f"start notification for {chara_id}")
-        self.setNotifications(service_id, chara_id, b"\x01\x00")
+        await self.perip.start_notify(chara_id, lambda sender, data: asyncio.create_task(self.worker(service_id, chara_id, data, queue)))
 
-    def stopNotifications(self, service_id, chara_id):
+    async def stopNotifications(self, service_id, chara_id):
         logger.debug(f"stop notification for {chara_id}")
-        self.setNotifications(service_id, chara_id, b"\x00\x00")
+        await self.perip.stop_notify(chara_id)
 
     def end_request(self):
         logger.debug("end_request of BLESession")
-        if self.delegate:
-            self.delegate.restart_notification_event.set()
         return self.status == self.DONE
 
 # Prepare certificate of the WSS server
