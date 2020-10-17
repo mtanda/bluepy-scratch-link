@@ -450,7 +450,7 @@ class BLESession(Session):
         err_msg = None
 
         if self.status == self.INITIAL and method == 'discover':
-            if not bluepy_helper_cap.is_set():
+            if platform.system() == 'Linux' and not bluepy_helper_cap.is_set():
                 logger.error("Capability is not set to bluepy helper.")
                 logger.error("Run bluepy_setcap.py with root privilege.")
                 logger.error("e.g. $ sudo bluepy_helper_cap.py")
