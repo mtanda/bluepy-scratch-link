@@ -383,6 +383,7 @@ class BLESession(Session):
         self.deviceName = None
         self.perip = None
         self.queue = asyncio.Queue()
+        self.motor_power = ['00', '00']
 
     def close(self):
         self.status = self.DONE
@@ -457,7 +458,8 @@ class BLESession(Session):
                 sys.exit(1)
             found_ifaces = 0
             try:
-                devices = await BleakScanner.discover(timeout=10.0)
+                devices = await BleakScanner.discover(timeout=2.0)
+                params['filters'][0]['services'] = ['CEBE69FD-1C0C-4B61-8D80-A89D1CBF6DA9']
                 for dev in devices:
                     if self.matches(dev, params['filters']):
                         self.found_devices.append(dev)
@@ -512,7 +514,7 @@ class BLESession(Session):
             c = s.get_characteristic(chara_id)
             if not c or c.uuid != chara_id:
                 logger.error(f"Failed to get characteristic {chara_id}")
-                self.status = self.DONE
+                #self.status = self.DONE
             else:
                 with self.lock:
                     b = await self.perip.read_gatt_char(chara_id)
@@ -537,11 +539,12 @@ class BLESession(Session):
             logger.debug("handle write request")
             service_id = params['serviceId']
             chara_id = params['characteristicId']
+            service_id, chara_id, data = translate(self, service_id, chara_id, bytearray.fromhex(''))
             s = await self.perip.get_services()
             c = s.get_characteristic(chara_id)
             if not c or c.uuid != chara_id:
                 logger.error(f"Failed to get characteristic {chara_id}")
-                self.status = self.DONE
+                #self.status = self.DONE
             else:
                 if params['encoding'] != 'base64':
                     logger.error("encoding other than base 64 is not "
@@ -550,6 +553,7 @@ class BLESession(Session):
                 data = base64.standard_b64decode(msg_bstr)
                 logger.debug("getting lock for c.write()")
                 with self.lock:
+                    service_id, chara_id, data = translate(self, service_id, chara_id, data)
                     await self.perip.write_gatt_char(chara_id, data)
                 logger.debug("released lock for c.write()")
                 res['result'] = len(data)
@@ -559,6 +563,7 @@ class BLESession(Session):
 
     async def worker(self, service_id, chara_id, data, queue):
         logger.debug(f"BLE notification: {chara_id} {data}")
+        service_id, chara_id, data = translate(self, service_id, chara_id, data)
         params = { 'serviceId': service_id,
            'characteristicId': chara_id,
            'encoding': 'base64' }
@@ -567,7 +572,41 @@ class BLESession(Session):
 
     async def startNotifications(self, service_id, chara_id):
         logger.debug(f"start notification for {chara_id}")
-        await self.perip.start_notify(chara_id, lambda sender, data: asyncio.create_task(self.worker(service_id, chara_id, data, queue)))
+        if service_id == '00001523-1212-efde-1523-785feabcd123' and chara_id == '00001527-1212-efde-1523-785feabcd123':
+            # register motor
+            params = { 'serviceId': service_id,
+            'characteristicId': chara_id,
+            'encoding': 'base64' }
+            data = bytearray.fromhex('01010001')
+            params['message'] = base64.standard_b64encode(data).decode('ascii')
+            self.notify('characteristicDidChange', params)
+
+            params = { 'serviceId': service_id,
+            'characteristicId': chara_id,
+            'encoding': 'base64' }
+            data = bytearray.fromhex('02010001')
+            params['message'] = base64.standard_b64encode(data).decode('ascii')
+            self.notify('characteristicDidChange', params)
+
+            # register sensor
+            ## distance
+            params = { 'serviceId': service_id,
+            'characteristicId': chara_id,
+            'encoding': 'base64' }
+            data = bytearray.fromhex('01010023')
+            params['message'] = base64.standard_b64encode(data).decode('ascii')
+            self.notify('characteristicDidChange', params)
+
+            ## tilt
+            params = { 'serviceId': service_id,
+            'characteristicId': chara_id,
+            'encoding': 'base64' }
+            data = bytearray.fromhex('02010022')
+            params['message'] = base64.standard_b64encode(data).decode('ascii')
+            self.notify('characteristicDidChange', params)
+
+            await self.perip.start_notify('6e400003-b5a3-f393-e0a9-e50e24dcca9e', lambda sender, data: asyncio.create_task(self.worker(service_id, chara_id, data, queue)))
+        #await self.perip.start_notify(chara_id, lambda sender, data: asyncio.create_task(self.worker(service_id, chara_id, data, queue)))
 
     async def stopNotifications(self, service_id, chara_id):
         logger.debug(f"stop notification for {chara_id}")
@@ -614,6 +653,45 @@ def stack_trace():
 
     for line in code:
          print(line)
+
+def translate(self, service_id, chara_id, data):
+    if (service_id == '00001523-1212-efde-1523-785feabcd123' and chara_id == '00001527-1212-efde-1523-785feabcd123') or (service_id == '00004f0e-1212-efde-1523-785feabcd123' and chara_id == '00001560-1212-efde-1523-785feabcd123'):
+        service_id = '00004f0e-1212-efde-1523-785feabcd123'
+        chara_id = '00001560-1212-efde-1523-785feabcd123'
+        #data = bytearray.fromhex('0301' + format(data[7], '02x') + format(data[7], '02x')) # distance
+        data = bytearray.fromhex('0302' + format(data[8], '02x') + format(data[7], '02x')) # tilt
+    if service_id == '00001523-1212-efde-1523-785feabcd123' and chara_id == '00001527-1212-efde-1523-785feabcd123':
+        chara_id = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'
+    if (service_id == '00004f0e-1212-efde-1523-785feabcd123' and chara_id == '00001565-1212-efde-1523-785feabcd123') or chara_id == '6e400002-b5a3-f393-e0a9-e50e24dcca9e':
+        # motor
+        if len(data) >= 4 and (data[0] == 1 or data[0] == 2) and data[1] == 1 and data[2] == 1:
+            motor_idx = data[0]
+            power = ''
+            if data[3] <= 128:
+                p = min(9, round(9 * data[3] / 128))
+                if motor_idx == 1:
+                    p = -p
+                    power = format(p & (2**8-1), '02x')
+                elif motor_idx == 2:
+                    power = format(p, '02x')
+            else:
+                p = 256 - data[3]
+                p = min(9, round(9 * data[3] / 128))
+                if motor_idx == 1:
+                    power = format(p, '02x')
+                elif motor_idx == 2:
+                    p = -p
+                    power = format(p & (2**8-1), '02x')
+            self.motor_power[motor_idx - 1] = power
+            data = bytearray.fromhex('fffe090101' + self.motor_power[0] + self.motor_power[1] + '0000000000fdfc')
+        # light
+        if len(data) >= 6 and data[0] == 6 and data[1] == 4:
+            c = min(7, int(data[4] / 15))
+            color = format(c, '02x')
+            #data = bytearray.fromhex('fffe090101000000' + color + color + color + '00fdfc')
+            data = bytearray.fromhex('fffe090102000000' + color + color + color + '00fdfc')
+        chara_id = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
+    return service_id, chara_id, data
 
 while True:
     try:
